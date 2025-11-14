@@ -12,7 +12,7 @@ export class ScriptsController {
       const { branchId,jobId } = req.body;
 
       // Log the incoming webhook data
-      console.log("📥 Received webhook pabbly processing request:");
+      console.log("📥 Received webhook pabbly processing request...");
 
       // Validate that we have the necessary data
       if (!branchId) {

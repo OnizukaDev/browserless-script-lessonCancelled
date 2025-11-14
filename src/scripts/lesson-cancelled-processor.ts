@@ -1,6 +1,7 @@
 // src/services/lesson-cancelled.processor.ts
-import { config as globlConfig } from "../config";
-import { BrowserErrorHandler } from "../utils/error-handler.utils";
+import {config as globlConfig} from "../config";
+import {TutorCruncherClient} from "../clients/tutor-cruncher.client";
+import {ResourceType} from "../enums/tc-resource-type.enums";
 
 /**
  * LessonCancelledProcessor
@@ -9,10 +10,8 @@ export class LessonCancelledProcessor {
     private username: string;
     private password: string;
     private branchId: number;
-    private totalProcessedAmount: number;
     private loginPageUrl: string;
     private branchLoginSelectorId: string;
-    private invoicesPageUrl: string | undefined;
     private minFilter: number | undefined;
     private maxFilter: number | undefined;
     private globalTimeout: number;
@@ -24,12 +23,10 @@ export class LessonCancelledProcessor {
         this.page = page;
         this.username = config.username || process.env.TC_USERNAME || "";
         this.password = config.password || process.env.TC_PASSWORD || "";
-        this.totalProcessedAmount = 0;
         this.branchId = Number(branchId);
         this.isOrthophonieBranch = this.branchId === 14409;
         this.loginPageUrl = config.integration_url || config.loginPageUrl || (process.env.TC_LOGIN_URL || "https://app.tutorax.com/login/");
         this.branchLoginSelectorId = config.branchLoginSelectorId || "";
-        this.invoicesPageUrl = config.invoicesPageUrl;
         this.minFilter = config.minFilter;
         this.maxFilter = config.maxFilter;
         this.globalTimeout = globlConfig?.puppeteer?.globalTimeout ?? 30000;
@@ -37,7 +34,7 @@ export class LessonCancelledProcessor {
     }
 
     /* ---------------------------
-       Existing helpers (logout/login)
+       (logout/login)
        --------------------------- */
 
     async logout() {
@@ -122,42 +119,6 @@ export class LessonCancelledProcessor {
         }
     }
 
-    /* ---------------------------
-       NEW: appointment helpers
-       --------------------------- */
-
-    /**
-     * (Optional) Fallback: parse service/job UI page to extract appointment links.
-     * You won't need this if you always call TutorCruncherClient from service, but it's handy as fallback.
-     */
-    async getAppointmentLinksFromJob(jobId: number): Promise<string[]> {
-        try {
-            const jobUrl = `${(this.loginPageUrl || "").replace(/\/login\/?$/, "/")}cal/service/${jobId}/`;
-            console.log(`Navigating to job page (UI) ${jobUrl}`);
-            await this.page.goto(jobUrl, { waitUntil: "networkidle2", timeout: this.globalTimeout });
-
-            await this.page.waitForSelector(".tcc-lessons, .card.card-custom, .list-group", { timeout: 8000 }).catch(() => null);
-
-            const links: string[] = await this.page.evaluate(() => {
-                const lessonsCard = document.querySelector(".tcc-lessons") || document.querySelector(".card.card-custom");
-                const anchors = lessonsCard
-                    ? lessonsCard.querySelectorAll(".list-group-item a[href*='/cal/appointments/']")
-                    : document.querySelectorAll(".list-group-item a[href*='/cal/appointments/']");
-                const arr: string[] = [];
-                anchors.forEach((a: any) => {
-                    if (a && a.href) arr.push(a.href);
-                });
-                return Array.from(new Set(arr));
-            });
-
-            console.log(`Found ${links.length} appointment links on job page`);
-            return links;
-        } catch (err) {
-            console.error("Error extracting appointment links from job page:", err);
-            return [];
-        }
-    }
-
     /**
      * Process a list of appointment UI URLs sequentially.
      * - retries each appointment up to 2 times on transient errors
@@ -183,9 +144,9 @@ export class LessonCancelledProcessor {
                     else results.skipped.push(url);
                     done = true;
                 } catch (err) {
-                    console.warn(`Attempt ${attempt} failed for ${url}:`, err?.message || err);
+                    console.warn(`Attempt ${attempt} failed for ${url}:`, err);
                     if (attempt > retries) {
-                        results.failed.push({ url, reason: err?.message || err });
+                        results.failed.push({ url, reason: err });
                         done = true;
                     } else {
                         // small backoff
@@ -210,122 +171,95 @@ export class LessonCancelledProcessor {
     async processAppointment(appointmentUrl: string): Promise<"cancelled" | "skipped"> {
         try {
             console.log(`➡️ Opening appointment ${appointmentUrl}`);
-            await this.page.goto(appointmentUrl, { waitUntil: "networkidle2", timeout: this.globalTimeout });
 
-            // check status badge quickly
-            const already = await this.page.evaluate(() => {
+            await this.page.goto(appointmentUrl, {
+                waitUntil: "networkidle2",
+                timeout: this.globalTimeout,
+            });
+
+            // ----- 1) Already cancelled?
+            const alreadyCancelled = await this.page.evaluate(() => {
                 const badge = document.querySelector(".status-badge");
                 if (!badge) return false;
                 const txt = (badge.textContent || "").toLowerCase();
-                const cls = (badge.className || "").toLowerCase();
-                if (txt.includes("cancel") || txt.includes("deleted") || cls.includes("apt-cancelled") || cls.includes("apt-deleted")) return true;
-                return false;
+                return txt.includes("cancel") || txt.includes("deleted");
             });
 
-            if (already) {
-                console.log("⏭️ Already cancelled/deleted — skipping");
+            if (alreadyCancelled) {
+                console.log("⏭️ Already cancelled — skipping");
                 return "skipped";
             }
 
-            // Try common edit selectors (anchors/buttons)
-            let clickedEdit = false;
-            const editSelectors = ['a[href*="/edit/"]', 'button.edit-appointment', 'a.btn-edit', 'a[data-action="edit"]'];
-            for (const sel of editSelectors) {
-                const h = await this.page.$(sel);
-                if (h) {
-                    try {
-                        await Promise.all([
-                            h.click(),
-                            this.page.waitForNavigation({ waitUntil: "networkidle2", timeout: 7000 }).catch(() => null),
-                        ]);
-                    } catch (_) {
-                        // if click doesn't navigate (modal), it's fine
-                    }
-                    clickedEdit = true;
-                    break;
-                }
-            }
-
-            // fallback: link by text "Edit"
-            if (!clickedEdit) {
-                const [linkHandle] = await this.page.$x("//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'edit')]");
-                if (linkHandle) {
-                    try {
-                        await Promise.all([
-                            linkHandle.click(),
-                            this.page.waitForNavigation({ waitUntil: "networkidle2", timeout: 7000 }).catch(() => null),
-                        ]);
-                    } catch (_) {}
-                    clickedEdit = true;
-                }
-            }
-
-            if (!clickedEdit) {
-                console.warn("⚠️ No edit control found — skipping this appointment");
+            // ----- 2) Find Cancel button
+            const cancelBtn = await this.page.$("a[href*='/cancel/']");
+            if (!cancelBtn) {
+                console.warn("⚠️ Cancel button not found — skipping appointment");
                 return "skipped";
             }
 
-            // small wait for form/modal to render
-            await this.page.waitForTimeout(500);
+            console.log("🟥 Clicking Cancel button...");
+            await cancelBtn.click();
 
-            // set status to cancelled
-            const setOk = await this.setStatusToCancelled();
-            if (!setOk) {
-                console.warn("⚠️ Couldn't set status to Cancelled — skipping");
-                return "skipped";
-            }
+            // ----- 3) Fill required Reason -----
+            console.log("🖊 Filling cancel reason...");
+            await this.page.evaluate(() => {
+                const textarea = document.querySelector("textarea[name='reason']") as HTMLTextAreaElement;
+                if (textarea) {
+                    textarea.value = "Cancelled by automation";
+                    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+                    textarea.dispatchEvent(new Event("change", { bubbles: true }));
+                }
 
-            // submit/save
-            const submitted = await this.page.evaluate(() => {
-                const btn = document.querySelector("button[type='submit'], input[type='submit'], .save-button, .btn-primary, .submit-modal");
-                if (btn) {
-                    (btn as HTMLElement).click();
-                    return true;
+                // If CodeMirror is active
+                const cm = document.querySelector(".CodeMirror") as any;
+                if (cm && cm.CodeMirror) {
+                    cm.CodeMirror.setValue("Cancelled by automation");
                 }
-                const form = document.querySelector("form");
-                if (form) {
-                    try {
-                        (form as HTMLFormElement).submit();
-                        return true;
-                    } catch (_) {
-                        return false;
-                    }
-                }
-                return false;
             });
 
-            if (!submitted) {
-                console.warn("⚠️ Could not submit the form — skipping (no submit button found)");
-                return "skipped";
-            }
+            // ----- 4) Click Submit -----
+            console.log("📝 Submitting cancel modal...");
+            await this.page.evaluate(() => {
+                const btn =
+                    document.querySelector(".submit-modal") ||
+                    document.querySelector("button[type='submit']") ||
+                    document.querySelector("input[type='submit']");
 
-            // wait for navigation or update
-            await this.page.waitForTimeout(1000);
-            await this.page.waitForNavigation({ waitUntil: "networkidle2", timeout: 7000 }).catch(() => null);
+                if (btn) (btn as HTMLElement).click();
+            });
 
-            // verify badge now
+            // ----- 5) Wait for modal to close -----
+            await this.page.waitForSelector(".modal.show", {
+                hidden: true,
+                timeout: 15000,
+            }).catch(() => {
+                console.warn("⚠️ Modal did not close — continuing anyway");
+            });
+
+
+            // ----- 6) Verify cancelled
             const nowCancelled = await this.page.evaluate(() => {
                 const badge = document.querySelector(".status-badge");
                 if (!badge) return false;
                 const txt = (badge.textContent || "").toLowerCase();
-                const cls = (badge.className || "").toLowerCase();
-                return txt.includes("cancel") || cls.includes("apt-cancelled") || cls.includes("apt-deleted");
+                return txt.includes("cancel") || txt.includes("deleted");
             });
 
             if (!nowCancelled) {
-                console.warn("⚠️ After submit, status not visibly cancelled — consider manual check");
-                // we still return 'cancelled' because action was attempted; adjust if you want stricter validation
+                console.warn("⚠️ Status not visibly cancelled — but action was sent");
                 return "cancelled";
             }
 
             console.log(`✅ Appointment cancelled: ${appointmentUrl}`);
             return "cancelled";
+
         } catch (error: any) {
-            console.error(`Error processing appointment ${appointmentUrl}:`, error?.message || error);
-            BrowserErrorHandler.handleBrowserError(error, `processAppointment-${appointmentUrl}`);
+            console.error(`❌ Error processing appointment ${appointmentUrl}:`, error?.message || error);
             throw error;
         }
     }
+
+
 
     /**
      * Robust setter: tries select boxes, radios, then button/text click.
@@ -388,5 +322,13 @@ export class LessonCancelledProcessor {
             console.error("Error in setStatusToCancelled:", err);
             return false;
         }
+    }
+
+    async wait(ms: number) {
+        await this.page.waitForFunction(
+            (time:any) => new Promise(res => setTimeout(res, time)),
+            {},
+            ms
+        );
     }
 }

@@ -1,17 +1,19 @@
 // src/services/lesson-cancelled.service.ts
 import puppeteer from "puppeteer-core";
-import { config } from "../config";
-import { BrowserErrorHandler } from "../utils/error-handler.utils";
-import { TutorCruncherClient } from "../clients/tutor-cruncher.client";
-import { LessonCancelledProcessor } from "../scripts/lesson-cancelled-processor";
-import { APPT_SCRIPT_CONFIG } from "../constants/script.constants";
+import {config} from "../config";
+import {BrowserErrorHandler} from "../utils/error-handler.utils";
+import {TutorCruncherClient} from "../clients/tutor-cruncher.client";
+import {LessonCancelledProcessor} from "../scripts/lesson-cancelled-processor";
+import {APPT_SCRIPT_CONFIG} from "../constants/script.constants";
+import {ResourceType} from "../enums/tc-resource-type.enums";
 
 export class LessonCancelledService {
     private browserlessEndpoint: string;
 
     constructor() {
         // prefer env var then fallback to app config
-        this.browserlessEndpoint = process.env.BROWSERLESS_ENDPOINT || config?.browserlessEndpoint || "";
+        this.browserlessEndpoint = process.env.BROWSER_PLAYWRIGHT_ENDPOINT || "";
+
     }
 
     /**
@@ -43,7 +45,7 @@ export class LessonCancelledService {
 
         // 2) prepare Puppeteer browser (connect to Browserless or launch local for debug)
         let browser: any = null;
-        const localDebug = process.env.LOCAL_PUPPETEER === "true" || process.env.LOCAL_PUPPETEER === "1";
+        const localDebug = false;
 
         try {
             if (localDebug) {
@@ -86,9 +88,25 @@ export class LessonCancelledService {
 
             console.log("✅ Appointments processing finished:", processingResult);
 
-            // attempt logout
+            // attempt logout & update job to finish
             try {
                 await processor.logout();
+
+                const tcClient = new TutorCruncherClient(branchId);
+                const jobData = await tcClient.getResourceById(ResourceType.SERVICES, jobId.toString());
+
+                if(jobData){
+                    console.log("Updating job to finish...");
+                    await tcClient.updateResource(ResourceType.SERVICES,
+                        {
+                            name:jobData.name,
+                            dft_charge_rate:jobData.dft_charge_rate,
+                            dft_contractor_rate:jobData.dft_contractor_rate,
+                            status:"finished"
+                        }
+                        ,jobId.toString());
+                }
+
             } catch (logoutErr) {
                 console.warn("⚠️ Logout failed:", logoutErr);
             }

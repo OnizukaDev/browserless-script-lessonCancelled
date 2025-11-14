@@ -10,8 +10,10 @@ export class ScriptWorker {
 
   constructor() {
     this.lessonCancelledService = new LessonCancelledService();
-    this.concurrency = Number(process.env.SCRIPTS_QUEUE_CONCURRENCY) || 2;
-    this.requireBrowserless = !(process.env.LOCAL_PUPETEER === "true" || process.env.LOCAL_PUPPETEER === "1");
+    this.concurrency = 1;
+    const local = true;
+    console.log(process.env.LOCAL_PUPPETEER);
+    this.requireBrowserless = !local;
 
     this.initializeProcessors();
   }
@@ -32,11 +34,18 @@ export class ScriptWorker {
     try {
       console.log(`🏃 Processing script job ${job.id}`);
 
-      // Basic validation of env for browserless usage
+      // validation of env for browserless usage
       if (this.requireBrowserless) {
-        const be = process.env.BROWSERLESS_ENDPOINT || (this.lessonCancelledService as any)?.browserlessEndpoint;
-        if (!be) {
-          const msg = "BROWSERLESS_ENDPOINT is not set and LOCAL_PUPPETEER is not enabled. Unable to run headless browser.";
+        // 🚀 FIX 2
+        const endpoint =
+            process.env.BROWSER_PLAYWRIGHT_ENDPOINT ||
+            process.env.BROWSER_WS_ENDPOINT ||
+            process.env.BROWSERLESS_ENDPOINT ||
+            process.env.BROWSER_WEBDRIVER_ENDPOINT;
+
+        if (!endpoint) {
+          const msg =
+              "❌ No Browserless endpoint configured and LOCAL_PUPPETEER is disabled.";
           console.error(msg);
           throw new Error(msg);
         }

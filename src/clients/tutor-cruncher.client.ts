@@ -3,21 +3,26 @@ import { BranchUtils } from "../utils/branch-utils";
 import { ResourceType } from "../enums/tc-resource-type.enums";
 
 
-interface Appointment {
+export interface TCAppointment {
   id: number;
-  start?: string;
-  finish?: string;
-  topic?: string;
-  status?: number | string;
-  service?: { id: number; name?: string; url?: string };
-  url?: string; // API url
+  start: string;
+  finish: string;
+  topic: string;
+  status: string;
+  url: string;
+  service: {
+    id: number;
+    name: string;
+  };
 }
-interface TCResponse {
+
+export interface TCResponse {
   count: number;
   next: string | null;
   previous: string | null;
-  results: Appointment[];
+  results: TCAppointment[];
 }
+
 
 export class TutorCruncherClient {
   private baseUrl: string;
@@ -147,44 +152,43 @@ export class TutorCruncherClient {
   public async getAppointmentUrls(jobId: number): Promise<string[]> {
     const collectedUrls: string[] = [];
     let nextPageUrl: string | null = `${this.baseUrl}/appointments/?service=${jobId}`;
-    let pageCount = 0;
 
     const allowedStatus = "planned";
 
-    // helper API URL -> UI URL
-    const apiToUi = (apiUrl: string) => {
-      if (!apiUrl) return null;
+    // Helper : convert API URL → UI URL
+    const apiToUi = (apiUrl: string): string | null => {
       const match = apiUrl.match(/\/appointments\/(\d+)\/?$/);
       if (!match) return null;
-      const appointmentId = match[1];
-      const baseUi = process.env.TC_UI_BASE_URL || "https://app.tutorax.com";
-      return `${baseUi.replace(/\/$/, "")}/cal/appointments/${appointmentId}/`;
-    };
 
-    console.log(`📡 Fetching appointments for jobId=${jobId} — status=${allowedStatus}`);
+      const id = match[1];
+      const baseUi = process.env.TC_UI_BASE_URL || "https://app.tutorax.com";
+      return `${baseUi.replace(/\/$/, "")}/cal/appointments/${id}/`;
+    };
 
     try {
       while (nextPageUrl) {
-        pageCount++;
-        console.log(`➡️ Fetching page ${pageCount}: ${nextPageUrl}`);
+        const response: import("axios").AxiosResponse<TCResponse> =
+            await axios.get<TCResponse>(nextPageUrl, {
+              headers: {
+                Authorization: `token ${this.token}`,
+                "Content-Type": "application/json",
+              },
+            });
 
-        const response = await axios.get<TCResponse>(nextPageUrl, {
-          headers: {
-            Authorization: `Token ${this.token}`,
-            "Content-Type": "application/json",
-          },
-        });
+        const data: TCResponse = response.data;
 
-        const data= response.data;
-
-        if (data.results && data.results.length > 0) {
-          const plannedAppointments = data.results.filter(
-              (appt) =>  appt.status.toLowerCase() === allowedStatus
+        // Vérifie si résultats présents
+        if (Array.isArray(data.results)) {
+          const pending = data.results.filter(
+              (appt: TCAppointment) =>
+                  appt.status.toLowerCase() == allowedStatus
           );
 
-          const urls = plannedAppointments
-              .map((appt) => (appt.url ? apiToUi(appt.url) : null))
-              .filter((u): u is string => Boolean(u));
+          const urls = pending
+              .map((appt: TCAppointment) =>
+                  appt.url ? apiToUi(appt.url) : null
+              )
+              .filter((u: string | null): u is string => Boolean(u));
 
           collectedUrls.push(...urls);
         }
@@ -192,12 +196,12 @@ export class TutorCruncherClient {
         nextPageUrl = data.next;
       }
 
-      console.log(`✅ Found ${collectedUrls.length} planned appointments for job ${jobId}`);
       return collectedUrls;
-    } catch (error: any) {
-      console.error(`❌ Error fetching appointments for job ${jobId}:`, error.message);
-      throw new Error("Failed to fetch appointments from TutorCruncher API");
+    } catch (err: any) {
+      console.error("❌ Error fetching appointment URLs:", err?.message || err);
+      throw err;
     }
   }
+
 
 }
